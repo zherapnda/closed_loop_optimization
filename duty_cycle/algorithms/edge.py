@@ -1,7 +1,6 @@
 import os
 import cv2
 import numpy as np
-from scipy.signal import find_peaks, peak_prominences
 from loader import to_gray, to_color
 
 DEFAULT_IMAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "images", "image2.png")
@@ -10,9 +9,48 @@ N_EDGE_SAMPLES = 20  # rows sampled along the height for each edge's line fit --
                      # noise in any single row barely moves a fit through this many points
 EDGE_OFFSET = 10  # grayscale units above each row's own local baseline
 EDGE_MARGIN_FRACTION = 0.25  # skip the top/bottom 25% of rows -- border/vignette artifacts live there
-FINGER_L = 130
-CONTRAST_WINDOW = 40  # samples on each side of a candidate x -- wide enough to span a few ridges for a stable prominence read
-CONTRAST_FRACTION = 0.3  # candidate must reach this fraction of the best contrast found nearby -- matches duty_profile.py's validated cutoff
+
+# physical calibration of the ROI, not a fitted/heuristic value. edge_x1/edge_x2
+# (the two fitted line-of-best-fit edges) are the two FURTHEST edges of the
+# metal fingers -- a known physical gap of TOTAL_FINGER_GAP_UM. The ROI we
+# actually want is the gap between the TIPS of two opposite fingers, a known
+# physical gap of FINGER_TIP_GAP_UM, centered in the middle of the full span.
+TOTAL_FINGER_GAP_UM = 90
+FINGER_TIP_GAP_UM = 45
+FINGER_L_FRACTION = (TOTAL_FINGER_GAP_UM - FINGER_TIP_GAP_UM) / (2 * TOTAL_FINGER_GAP_UM)  # 0.25 inward margin per side
+
+# empirical buffer on top of the exact physical margin above -- edge_x1/edge_x2
+# (the fitted outer-boundary lines) don't always land precisely on the true
+# outer metal edge, so the exact-physics FINGER_L_FRACTION math can still land
+# a few pixels inside the metal finger's own tip. Confirmed by direct visual
+# inspection of a real image (E8): a visibly different, tighter periodic
+# pattern -- the metal tip's own serration, not the domain grating -- started
+# a handful of pixels inside the calibrated x_right. This is a per-side pixel
+# safety margin, not a physical constant -- retune here, not FINGER_L_FRACTION.
+# Raised from 0.05 to 0.10 after 0.05 still left visible metal intrusion on
+# the right side of several images (D12/D13/D14 mildly, E7/H8 severely).
+EDGE_SAFETY_MARGIN_FRACTION = 0.10
+
+
+MAD_OUTLIER_THRESHOLD = 3.5  # modified z-score cutoff (Iglewicz & Hoaglin) -- standard robust-outlier threshold
+
+
+def reject_edge_outliers(points, threshold=MAD_OUTLIER_THRESHOLD):
+    """Drop points whose x is a robust outlier vs. the rest of this edge's
+    detected points, via a MAD-based modified z-score. A single bad row (e.g.
+    a border/vignette artifact detect_edge_points latched onto despite
+    EDGE_MARGIN_FRACTION) sitting at the extreme top or bottom of the sampled
+    rows has outsized leverage on cv2.fitLine's slope -- Huber loss alone
+    doesn't reliably discount it when it's only 1-2 points out of ~20."""
+    if len(points) < 4:
+        return points
+    xs = np.array([p[0] for p in points], dtype=float)
+    median_x = np.median(xs)
+    mad = np.median(np.abs(xs - median_x))
+    if mad == 0:
+        return points
+    modified_z = 0.6745 * (xs - median_x) / mad
+    return [p for p, z in zip(points, modified_z) if abs(z) <= threshold]
 
 
 def detect_edge_points(gray, rows, from_right=False):
@@ -34,14 +72,44 @@ def detect_edge_points(gray, rows, from_right=False):
     return points
 
 
-def local_contrast(signal, center, window):
-    lo = max(0, center - window)
-    hi = min(len(signal), center + window)
-    segment = signal[lo:hi]
-    peaks, _ = find_peaks(segment, distance=2, prominence=2)
-    if len(peaks) == 0:
-        return 0.0
-    return float(np.median(peak_prominences(segment, peaks)[0]))
+def detect_boundary_tilt(gray, margin_fraction=EDGE_MARGIN_FRACTION, n_samples=N_EDGE_SAMPLES):
+    """Detect the two outer finger-comb boundary lines in gray and return
+    their averaged, numerically-stable tilt as (dir_x, dir_y) -- same
+    approach as detect_roi's own internal computation, factored out
+    separately so it can be re-run on an ALREADY-DESKEWED image.
+
+    Why re-run rather than reuse detect_roi's result: the boundary's tilt is
+    measured in whatever frame gray is in. detect_roi measures it in the
+    original (pre-deskew) image, but compute_duty_cycle sweeps columns on
+    the deskewed image -- a rotation composes onto that tilt, so reusing the
+    pre-deskew number directly would need converting it through the deskew
+    rotation by hand. Measuring fresh on the deskewed image sidesteps that
+    composition (and the sign-convention risk that comes with it) entirely."""
+    bottom_row_index = gray.shape[0] - 1
+    sample_rows = np.linspace(
+        int(margin_fraction * bottom_row_index),
+        int((1 - margin_fraction) * bottom_row_index),
+        n_samples,
+        dtype=int,
+    )
+    left_points = reject_edge_outliers(detect_edge_points(gray, sample_rows, from_right=False))
+    right_points = reject_edge_outliers(detect_edge_points(gray, sample_rows, from_right=True))
+    if len(left_points) < 2 or len(right_points) < 2:
+        raise RuntimeError("Not enough edge points detected to measure boundary tilt.")
+
+    left_arr = np.array(left_points, dtype=np.int32)
+    vx, vy, _, _ = cv2.fitLine(left_arr, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+    if vy < 0:
+        vx, vy = -vx, -vy
+
+    right_arr = np.array(right_points, dtype=np.int32)
+    vx2, vy2, _, _ = cv2.fitLine(right_arr, cv2.DIST_HUBER, 0, 0.01, 0.01).flatten()
+    if vy2 < 0:
+        vx2, vy2 = -vx2, -vy2
+
+    avg_vx, avg_vy = (vx + vx2) / 2, (vy + vy2) / 2
+    norm = np.hypot(avg_vx, avg_vy)
+    return float(avg_vx / norm), float(avg_vy / norm)
 
 
 def detect_roi(image, roi_height=400, show=True):
@@ -52,7 +120,6 @@ def detect_roi(image, roi_height=400, show=True):
     gray = to_gray(image)
 
     bottom_row_index = gray.shape[0] - 1
-    middle_row_index = gray.shape[0] // 2
     sample_rows = np.linspace(
         int(EDGE_MARGIN_FRACTION * bottom_row_index),
         int((1 - EDGE_MARGIN_FRACTION) * bottom_row_index),
@@ -69,8 +136,13 @@ def detect_roi(image, roi_height=400, show=True):
     if len(left_points) < 2 or len(right_points) < 2:
         raise RuntimeError("Not enough edge points detected.")
 
-    rowm = gray[middle_row_index]
-    smoothedm = np.convolve(rowm.astype(float), np.ones(5) / 5, mode="same")
+    left_points_clean = reject_edge_outliers(left_points)
+    right_points_clean = reject_edge_outliers(right_points)
+    if len(left_points_clean) < len(left_points):
+        print(f"Left edge: dropped {len(left_points) - len(left_points_clean)} outlier point(s) before line fit")
+    if len(right_points_clean) < len(right_points):
+        print(f"Right edge: dropped {len(right_points) - len(right_points_clean)} outlier point(s) before line fit")
+    left_points, right_points = left_points_clean, right_points_clean
 
     img = to_color(image)
 
@@ -114,6 +186,11 @@ def detect_roi(image, roi_height=400, show=True):
     cv2.putText(img, f"x={edge_x1}", (max(0, edge_x1 - 20), 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
     cv2.putText(img, f"x={edge_x2}", (max(0, edge_x2 - 20), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
+    FINGER_L = int(round(FINGER_L_FRACTION * (edge_x2 - edge_x1)))
+    EDGE_SAFETY_MARGIN = int(round(EDGE_SAFETY_MARGIN_FRACTION * (edge_x2 - edge_x1)))
+    print(f"edge_x1={edge_x1}, edge_x2={edge_x2}, FINGER_L={FINGER_L} ({FINGER_L_FRACTION:.2f} of span), "
+          f"edge_safety_margin={EDGE_SAFETY_MARGIN} ({EDGE_SAFETY_MARGIN_FRACTION:.2f} of span)")
+
     angle_deg = 4.48
     angle_rad = np.deg2rad(angle_deg)
     horizontal_dist = float(edge_x2 - edge_x1)
@@ -144,38 +221,35 @@ def detect_roi(image, roi_height=400, show=True):
     avg_vx = (vx + vx2) / 2
     length = 1000
 
-    x03, y03 = edge_x1 + FINGER_L, bottom_row_index
-    dx3 = int(np.cos(np.arctan(avg_m)) * length)
-    dy3 = int(np.sin(np.arctan(avg_m)) * length)
+    # avg_m (rise/run = vy/vx) is a reasonable summary slope for a mostly-
+    # horizontal line, but these edges are mostly VERTICAL (small grating
+    # tilt is the normal case for this device) -- dividing by the near-zero
+    # vx there makes slope1/slope2 numerically unstable, amplifying ordinary
+    # per-row detection noise into wild, even sign-flipped values (confirmed
+    # on a real image: -48.7 vs +59.7 for two edges of the same rigid comb,
+    # which should be near-identical). Direction is instead taken straight
+    # from the averaged (vx, vy) unit vector -- stable regardless of how
+    # close to vertical the line is, since it never divides by either
+    # component alone.
+    norm = np.hypot(avg_vx, avg_vy)
+    dir_x, dir_y = avg_vx / norm, avg_vy / norm
 
-    t = (middle_row_index - y03) / avg_vy
-    x_mid = int(x03 + t * avg_vx)
-
-    search_limit = min(len(smoothedm), x_mid + 300)
-    candidates = list(range(x_mid, search_limit))
-    contrasts = [local_contrast(smoothedm, x, CONTRAST_WINDOW) for x in candidates]
-    best_contrast = max(contrasts) if contrasts else 0.0
-    contrast_cutoff = CONTRAST_FRACTION * best_contrast
-
-    x_search = x_mid
-    for x, c in zip(candidates, contrasts):
-        if c >= contrast_cutoff:
-            x_search = x
-            break
-
-    print(f"Line at x_mid={x_mid} -> moved to x={x_search} "
-          f"(contrast={local_contrast(smoothedm, x_search, CONTRAST_WINDOW):.2f}, cutoff={contrast_cutoff:.2f})")
-
-    x03 += x_search - x_mid
+    # x03/x04 are the physically-calibrated ROI edges (see FINGER_L_FRACTION
+    # above) -- no contrast-based adjustment. A contrast search here would
+    # chase high-contrast regions, which an overpoled area lacks by
+    # definition, silently excluding exactly the region that matters most.
+    x03, y03 = edge_x1 + FINGER_L + EDGE_SAFETY_MARGIN, bottom_row_index
+    dx3 = int(dir_x * length)
+    dy3 = int(dir_y * length)
 
     pt5 = (max(0, x03 - dx3), max(0, y03 - dy3))
     pt6 = (min(img.shape[1] - 1, x03 + dx3), min(img.shape[0] - 1, y03 + dy3))
 
     cv2.line(img, pt5, pt6, (128, 0, 255), 2)
 
-    x04, y04 = edge_x2 - FINGER_L, bottom_row_index
-    dx4 = int(np.cos(np.arctan(avg_m)) * length)
-    dy4 = int(np.sin(np.arctan(avg_m)) * length)
+    x04, y04 = edge_x2 - FINGER_L - EDGE_SAFETY_MARGIN, bottom_row_index
+    dx4 = int(dir_x * length)
+    dy4 = int(dir_y * length)
 
     pt7 = (max(0, x04 - dx4), max(0, y04 - dy4))
     pt8 = (min(img.shape[1] - 1, x04 + dx4), min(img.shape[0] - 1, y04 + dy4))
@@ -185,10 +259,17 @@ def detect_roi(image, roi_height=400, show=True):
     roi_top_y = 0
     roi_bottom_y = roi_height
 
-    x03_top = x03 + (roi_top_y - y03) / avg_m
-    x03_bottom = x03 + (roi_bottom_y - y03) / avg_m
-    x04_top = x04 + (roi_top_y - y04) / avg_m
-    x04_bottom = x04 + (roi_bottom_y - y04) / avg_m
+    # run per unit rise (dir_x/dir_y), not avg_m's rise-per-run -- see the
+    # note above dir_x/dir_y's definition. This extrapolates x03/x04 (anchored
+    # at the image bottom) up to roi_top_y over a potentially large number of
+    # rows, so an unstable slope here doesn't just add noise, it can shift the
+    # whole ROI by tens of pixels (confirmed: ~54px on a real image before
+    # this fix).
+    inv_slope = dir_x / dir_y
+    x03_top = x03 + (roi_top_y - y03) * inv_slope
+    x03_bottom = x03 + (roi_bottom_y - y03) * inv_slope
+    x04_top = x04 + (roi_top_y - y04) * inv_slope
+    x04_bottom = x04 + (roi_bottom_y - y04) * inv_slope
 
     roi_box = np.array([
         [int(round(x03_top)), roi_top_y],
@@ -213,8 +294,15 @@ def detect_roi(image, roi_height=400, show=True):
 
     return {
         "slope": avg_m,
+        # the physically-calibrated ROI (FINGER_TIP_GAP_UM, centered in the
+        # detected span) -- this is the tall region to sweep for measurement.
         "x_left": int(round(x_left)),
         "x_right": int(round(x_right)),
+        # full detected boundary span (edge of metal to edge of metal) --
+        # reference/debugging only, not safe to sweep: includes the metal
+        # fingers themselves.
+        "full_x_left": edge_x1,
+        "full_x_right": edge_x2,
     }
 
 

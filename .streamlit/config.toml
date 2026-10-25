@@ -1,0 +1,29 @@
+# Scientific, minimal light theme -- clean whites/greys, monospace for numeric
+# readouts, restrained blue accent (no heavy branding color), minimal borders.
+[theme]
+base = "light"
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F8FA"
+codeBackgroundColor = "#F1F3F5"
+textColor = "#1A1D21"
+linkColor = "#2563EB"
+borderColor = "#E5E7EB"
+showWidgetBorder = false
+showSidebarBorder = false
+baseRadius = "4px"
+buttonRadius = "4px"
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+codeFontSize = "0.85rem"
+baseFontSize = 14
+baseFontWeight = 400
+headingFontSizes = ["28px", "22px", "18px", "16px", "14px", "13px"]
+headingFontWeights = [600, 600, 600, 500, 500, 500]
+linkUnderline = false
+chartCategoricalColors = ["#2563EB", "#059669", "#D97706", "#DC2626", "#7C3AED", "#0891B2"]
+dataframeBorderColor = "#E5E7EB"
+dataframeHeaderBackgroundColor = "#F7F8FA"
+
+[server]
+maxUploadSize = 200

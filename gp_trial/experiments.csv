@@ -1,0 +1,1 @@
+experiment_num,structure_id,timestamp,amplitude,rise,dwell,fall,duty_cycle_mean,duty_cycle_std,output,source,deskew_angle,image_path,gp_pred_mean,gp_pred_std,gp_fallback
